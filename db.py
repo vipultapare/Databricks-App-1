@@ -4,9 +4,13 @@ Handles secure connection, query execution, and data retrieval for the Sales Ana
 """
 
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
+
+# Lock to prevent concurrent OAuth authorization handshakes
+_connection_lock = threading.Lock()
 
 # Load environment variables from .env file (if present)
 load_dotenv()
@@ -33,6 +37,8 @@ def get_connection_config() -> Dict[str, Any]:
 
     http_path = os.getenv("DATABRICKS_HTTP_PATH", "").strip()
     token = (os.getenv("DATABRICKS_TOKEN") or os.getenv("DATABRICKS_ACCESS_TOKEN") or "").strip()
+    if token.startswith("your_") or "token_here" in token:
+        token = ""
     auth_type = os.getenv("DATABRICKS_AUTH_TYPE", "").strip()
     client_id = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
     client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
@@ -82,6 +88,7 @@ def validate_connection_config() -> Tuple[bool, str]:
 def get_connection():
     """
     Establishes and returns a new Databricks SQL connection using the installed connector.
+    Thread-safe and uses local OAuth token persistence for U2M.
     """
     from databricks import sql
 
@@ -90,13 +97,20 @@ def get_connection():
         raise ValueError(error_msg)
 
     config = get_connection_config()
-    connect_args = {
+    connect_args: Dict[str, Any] = {
         "server_hostname": config["server_hostname"],
         "http_path": config["http_path"],
     }
 
     if config["auth_type"].lower() == "databricks-oauth":
         connect_args["auth_type"] = "databricks-oauth"
+        # Persist OAuth tokens to local file so subsequent queries reuse token without reopening browser
+        try:
+            from databricks.sql.experimental.oauth_persistence import DevOnlyFilePersistence
+            cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".databricks_oauth_cache.json")
+            connect_args["experimental_oauth_persistence"] = DevOnlyFilePersistence(cache_file)
+        except Exception:
+            pass
     elif config["client_id"] and config["client_secret"]:
         connect_args["client_id"] = config["client_id"]
         connect_args["client_secret"] = config["client_secret"]
@@ -105,7 +119,8 @@ def get_connection():
     else:
         raise ValueError("Could not determine Databricks authentication mechanism.")
 
-    return sql.connect(**connect_args)
+    with _connection_lock:
+        return sql.connect(**connect_args)
 
 
 def run_query(query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -262,31 +277,59 @@ def get_filter_options() -> Dict[str, Any]:
     categories: List[str] = []
     statuses: List[str] = []
 
+    conn = None
+    cursor = None
     try:
-        df_dates = run_query(date_query)
-        if not df_dates.empty and pd.notna(df_dates.iloc[0]["min_date"]):
-            min_date = pd.to_datetime(df_dates.iloc[0]["min_date"]).date()
-            max_date = pd.to_datetime(df_dates.iloc[0]["max_date"]).date()
-    except Exception:
-        pass
+        conn = get_connection()
+        cursor = conn.cursor()
 
-    try:
-        df_reg = run_query(region_query)
-        regions = df_reg["region"].dropna().astype(str).tolist()
-    except Exception:
-        pass
+        # 1. Date range
+        try:
+            cursor.execute(date_query)
+            rows = cursor.fetchall()
+            if rows and rows[0][0] is not None:
+                min_date = pd.to_datetime(rows[0][0]).date()
+                max_date = pd.to_datetime(rows[0][1]).date()
+        except Exception:
+            pass
 
-    try:
-        df_cat = run_query(category_query)
-        categories = df_cat["category"].dropna().astype(str).tolist()
-    except Exception:
-        pass
+        # 2. Regions
+        try:
+            cursor.execute(region_query)
+            rows = cursor.fetchall()
+            regions = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            pass
 
-    try:
-        df_stat = run_query(status_query)
-        statuses = df_stat["order_status"].dropna().astype(str).tolist()
+        # 3. Categories
+        try:
+            cursor.execute(category_query)
+            rows = cursor.fetchall()
+            categories = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            pass
+
+        # 4. Statuses
+        try:
+            cursor.execute(status_query)
+            rows = cursor.fetchall()
+            statuses = [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            pass
+
     except Exception:
         pass
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return {
         "min_date": min_date,

@@ -142,6 +142,11 @@ def render_sidebar_connection_status():
             st.caption(f"Warehouse Path: `{config['http_path']}`")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_cached_filters() -> Dict[str, Any]:
+    return db.get_filter_options()
+
+
 def render_sidebar_filters() -> Dict[str, Any]:
     """
     Renders interactive filters in the sidebar:
@@ -156,7 +161,7 @@ def render_sidebar_filters() -> Dict[str, Any]:
         st.markdown("### 🔍 Filters")
 
         try:
-            filter_data = db.get_filter_options()
+            filter_data = _get_cached_filters()
         except Exception:
             filter_data = {
                 "min_date": datetime.date(2023, 1, 1),

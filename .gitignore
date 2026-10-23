@@ -8,6 +8,7 @@ env/
 .env
 .env.local
 .streamlit/secrets.toml
+.databricks_oauth_cache.json
 
 # Python Cache & Bytecode
 __pycache__/
