@@ -2,3 +2,12 @@ command:
   - streamlit
   - run
   - app.py
+env:
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql-warehouse
+  - name: CUSTOMERS_TABLE
+    valueFrom: customers-table
+  - name: ORDERS_TABLE
+    valueFrom: orders-table
+  - name: PRODUCTS_TABLE
+    valueFrom: products-table

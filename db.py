@@ -16,29 +16,50 @@ _connection_lock = threading.Lock()
 load_dotenv()
 
 # Fully Qualified Table Names as defined in Databricks Free Edition
-TABLE_CUSTOMERS = "workspace.sales_demo.customers"
-TABLE_PRODUCTS = "workspace.sales_demo.products"
-TABLE_ORDERS = "workspace.sales_demo.orders"
+TABLE_CUSTOMERS = os.getenv(
+    "CUSTOMERS_TABLE", "workspace.sales_demo.customers"
+)
+TABLE_PRODUCTS = os.getenv(
+    "PRODUCTS_TABLE", "workspace.sales_demo.products"
+)
+TABLE_ORDERS = os.getenv(
+    "ORDERS_TABLE", "workspace.sales_demo.orders"
+)
+
 
 
 def get_connection_config() -> Dict[str, Any]:
-    """
-    Reads and sanitizes Databricks SQL connection configuration from environment variables.
-    Never exposes or logs raw credentials.
-    """
+    """Read Databricks SQL connection settings without exposing credentials."""
+
     server_hostname = (
         os.getenv("DATABRICKS_SERVER_HOSTNAME")
         or os.getenv("DATABRICKS_HOST")
         or ""
     ).strip()
 
-    # Clean server hostname (remove https:// protocol and trailing slashes if user pasted full URL)
-    server_hostname = server_hostname.replace("https://", "").replace("http://", "").rstrip("/")
+    server_hostname = (
+        server_hostname
+        .replace("https://", "")
+        .replace("http://", "")
+        .rstrip("/")
+    )
 
+    warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID", "").strip()
     http_path = os.getenv("DATABRICKS_HTTP_PATH", "").strip()
-    token = (os.getenv("DATABRICKS_TOKEN") or os.getenv("DATABRICKS_ACCESS_TOKEN") or "").strip()
+
+    # Databricks Apps provides the warehouse ID as a resource.
+    if warehouse_id:
+        http_path = f"/sql/1.0/warehouses/{warehouse_id}"
+
+    token = (
+        os.getenv("DATABRICKS_TOKEN")
+        or os.getenv("DATABRICKS_ACCESS_TOKEN")
+        or ""
+    ).strip()
+
     if token.startswith("your_") or "token_here" in token:
         token = ""
+
     auth_type = os.getenv("DATABRICKS_AUTH_TYPE", "").strip()
     client_id = os.getenv("DATABRICKS_CLIENT_ID", "").strip()
     client_secret = os.getenv("DATABRICKS_CLIENT_SECRET", "").strip()
@@ -46,50 +67,40 @@ def get_connection_config() -> Dict[str, Any]:
     return {
         "server_hostname": server_hostname,
         "http_path": http_path,
+        "warehouse_id": warehouse_id,
         "token": token,
         "auth_type": auth_type,
         "client_id": client_id,
         "client_secret": client_secret,
+        "is_databricks_app": bool(warehouse_id),
     }
 
 
+
+
 def validate_connection_config() -> Tuple[bool, str]:
-    """
-    Validates whether required configuration keys exist without leaking values.
-    Returns (is_valid, message).
-    """
     config = get_connection_config()
 
     if not config["server_hostname"]:
-        return (
-            False,
-            "Missing DATABRICKS_SERVER_HOSTNAME in .env (e.g. your-workspace.cloud.databricks.com)",
-        )
+        return False, "Missing Databricks workspace hostname."
 
     if not config["http_path"]:
-        return (
-            False,
-            "Missing DATABRICKS_HTTP_PATH in .env (e.g. /sql/1.0/warehouses/xxxxxx)",
-        )
+        return False, "Missing DATABRICKS_HTTP_PATH or DATABRICKS_WAREHOUSE_ID."
 
     has_token = bool(config["token"])
     has_oauth_u2m = config["auth_type"].lower() == "databricks-oauth"
     has_m2m = bool(config["client_id"] and config["client_secret"])
 
     if not (has_token or has_oauth_u2m or has_m2m):
-        return (
-            False,
-            "No authentication method configured. Provide DATABRICKS_TOKEN (PAT) or set DATABRICKS_AUTH_TYPE=databricks-oauth.",
-        )
+        return False, "No supported Databricks authentication method configured."
 
     return True, "Configuration present"
 
 
+
+
 def get_connection():
-    """
-    Establishes and returns a new Databricks SQL connection using the installed connector.
-    Thread-safe and uses local OAuth token persistence for U2M.
-    """
+    """Connect using app identity in Databricks Apps or OAuth locally."""
     from databricks import sql
 
     is_valid, error_msg = validate_connection_config()
@@ -97,27 +108,60 @@ def get_connection():
         raise ValueError(error_msg)
 
     config = get_connection_config()
+
     connect_args: Dict[str, Any] = {
         "server_hostname": config["server_hostname"],
         "http_path": config["http_path"],
     }
 
-    if config["auth_type"].lower() == "databricks-oauth":
+    if config.get("is_databricks_app"):
+        # Use the deployed app's service-principal identity.
+        from databricks.sdk.core import Config
+
+        sdk_config = Config()
+
+        if not sdk_config.host:
+            raise ValueError(
+                "Databricks workspace host is unavailable in the app environment."
+            )
+
+        connect_args["server_hostname"] = (
+            sdk_config.host.replace("https://", "")
+            .replace("http://", "")
+            .rstrip("/")
+        )
+        connect_args["credentials_provider"] = lambda: sdk_config.authenticate
+
+    elif config["auth_type"].lower() == "databricks-oauth":
+        # Keep interactive OAuth for local development.
         connect_args["auth_type"] = "databricks-oauth"
-        # Persist OAuth tokens to local file so subsequent queries reuse token without reopening browser
+
         try:
-            from databricks.sql.experimental.oauth_persistence import DevOnlyFilePersistence
-            cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".databricks_oauth_cache.json")
-            connect_args["experimental_oauth_persistence"] = DevOnlyFilePersistence(cache_file)
+            from databricks.sql.experimental.oauth_persistence import (
+                DevOnlyFilePersistence,
+            )
+
+            cache_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                ".databricks_oauth_cache.json",
+            )
+            connect_args["experimental_oauth_persistence"] = (
+                DevOnlyFilePersistence(cache_file)
+            )
         except Exception:
             pass
+
     elif config["client_id"] and config["client_secret"]:
         connect_args["client_id"] = config["client_id"]
         connect_args["client_secret"] = config["client_secret"]
+
     elif config["token"]:
         connect_args["access_token"] = config["token"]
+
     else:
-        raise ValueError("Could not determine Databricks authentication mechanism.")
+        raise ValueError(
+            "Could not determine Databricks authentication mechanism."
+        )
 
     with _connection_lock:
         return sql.connect(**connect_args)
